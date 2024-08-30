@@ -201,7 +201,7 @@ int get_serverinfo(const char *pAddr)
 {
 	int iRetVal = HPR_ERROR;
 	char szUrl[UTIL_MAX_URL_LEN] = {0};
-	char szReturn[2048] = {0};
+	char szReturn[204800] = {0};
 	int nLen = sizeof(szReturn);
 
 	do

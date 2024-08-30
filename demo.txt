@@ -1,0 +1,249 @@
+#include "util_urlopt.h"
+
+#define ENGINE_GET_SESSION   "http://%s:%d/engine/rest/security/getSession?format=json"    //获取session信息
+#define ENGINE_REGISTER_URL  "http://%s:%d/engine/rest/security/register?format=json"      //注册本机信息
+#define ENGINE_PORT (9090)
+static HPR_INT32 g_engine_port = ENGINE_PORT;
+
+static HPR_INT32 engine_parse_session_val(HPR_INT8 *pAutInfo, ENGINE_SESSION *pstSessInfo)
+{
+	HPR_INT32 iRetVal = HPR_ERROR;
+	cJSON *pRoot = NULL;
+	cJSON *pItem = NULL;
+
+	do
+	{
+		if (NULL == pAutInfo || NULL == pstSessInfo)
+		{
+			ENGINE_ERR ("param is null!pAutInfo[%p] pSessInfo[%p]", pAutInfo, pstSessInfo);
+			break;
+		}
+
+		ENGINE_INFO ("%s", pAutInfo);
+		pRoot = cJSON_Parse(pAutInfo);
+		if (NULL == pRoot)
+		{
+			break;
+		}
+
+		pItem = cJSON_GetObjectItem(pRoot, "errorCode");
+		if (NULL == pItem || pItem->type != cJSON_Number || pItem->valueint != 0)
+		{
+			break;
+		}
+
+		cJSON *pData = cJSON_GetObjectItem(pRoot, "data");
+		if (NULL != pData)
+		{
+			pItem = cJSON_GetObjectItem(pData, "sessionID");
+			if (pItem != NULL && pItem->type == cJSON_String && pItem->valuestring != NULL)
+			{
+				HPR_Strncpy(pstSessInfo->szSession, pItem->valuestring, sizeof(pstSessInfo->szSession));
+			}
+
+			pItem = cJSON_GetObjectItem(pData, "challenge");
+			if (pItem != NULL && pItem->type == cJSON_String && pItem->valuestring != NULL)
+			{
+				HPR_Strncpy(pstSessInfo->szChallenge, pItem->valuestring, sizeof(pstSessInfo->szChallenge));
+			}
+
+			pItem = cJSON_GetObjectItem(pData, "iterations");
+			if (pItem != NULL && pItem->type == cJSON_Number)
+			{
+				pstSessInfo->iIterations = pItem->valueint;
+			}
+
+			pItem = cJSON_GetObjectItem(pData, "isIrreversible");
+			if (pItem != NULL && pItem->type == cJSON_Number)
+			{
+				pstSessInfo->bIrrerverible = (pItem->valueint == 1);
+			}
+
+			pItem = cJSON_GetObjectItem(pData, "salt");
+			if (pItem != NULL && pItem->type == cJSON_String && pItem->valuestring != NULL)
+			{
+				HPR_Strncpy(pstSessInfo->szSalt, pItem->valuestring, sizeof(pstSessInfo->szSalt));
+			}
+		}
+
+		iRetVal = HPR_OK;
+	}while(0);
+
+	if (NULL != pRoot)
+	{
+		cJSON_Delete(pRoot);
+		pRoot = NULL;
+	}
+
+	return iRetVal;
+}
+
+
+/*************************************************************
+函    数    名:auth_getSession
+函  数  描  述:获取本机授权服务的session信息
+输  入  参  数:
+输  出  参  数:
+返  回  类  型:HPR_INT32
+备          注:
+作          者:liuxuwei
+时          间:2021-03-02
+*************************************************************/
+static HPR_INT32 engine_getSession(ENGINE_SESSION *pstSessInfo, const HPR_INT8 *pAddr)
+{
+	HPR_INT32 iRetVal = HPR_ERROR;
+	HPR_INT8 szUrl[UTIL_MAX_URL_LEN] = {0};
+	HPR_INT8 szReturn[2048] = {0};
+	HPR_INT32 nLen = sizeof(szReturn);
+
+	do
+	{
+		if (NULL == pstSessInfo || NULL == pAddr)
+		{
+			break;
+		}
+
+		HPR_Snprintf(szUrl, sizeof(szUrl), ENGINE_GET_SESSION, pAddr, g_engine_port);
+		iRetVal = URLOPT_Get(szUrl, (HPR_UINT8 *)szReturn, (HPR_UINT32 *)&nLen, 5);
+		if (HPR_OK != iRetVal)
+		{
+			ENGINE_ERR ("get [%s] faild! retval[%d]", szUrl, iRetVal);
+			break;
+		}
+
+		iRetVal = engine_parse_session_val(szReturn, pstSessInfo);
+		if (HPR_OK != iRetVal)
+		{
+			break;
+		}
+
+		iRetVal = HPR_OK;
+	}while(0);
+
+	return iRetVal;
+}
+
+
+static HPR_INT32 engine_parse_register_val(const HPR_INT8 *pOutData)
+{
+	HPR_INT32 iRetVal = HPR_ERROR;
+	cJSON *pRoot = NULL;
+	cJSON *pItem = NULL;
+
+	do
+	{
+		if (NULL == pOutData)
+		{
+			break;
+		}
+
+		pRoot = cJSON_Parse(pOutData);
+		if (NULL == pRoot)
+		{
+			break;
+		}
+
+		pItem = cJSON_GetObjectItem(pRoot, "errorCode");
+		if (NULL == pItem)
+		{
+			break;
+		}
+
+		if (pItem->valueint != 0)
+		{
+			iRetVal = pItem->valueint;
+			pItem = cJSON_GetObjectItem(pRoot, "errorMsg");
+			if (pItem != NULL && pItem->valuestring != NULL)
+			{
+				ENGINE_ERR("errorMsg[%s]", pItem->valuestring);
+			}
+			break;
+		}
+
+		iRetVal = HPR_OK;
+	}while(0);
+
+	if (NULL != pRoot)
+	{
+		cJSON_Delete(pRoot);
+		pRoot = NULL;
+	}
+
+	return iRetVal;
+}
+
+/*************************************************************
+函    数    名:_engine_register
+函  数  描  述:向引擎服务注册本机信息
+输  入  参  数:
+输  出  参  数:
+返  回  类  型:HPR_INT32
+备          注:
+作          者:liuxuwei
+时          间:2021-03-02
+*************************************************************/
+static HPR_INT32 _engine_register(RESG_PARAM *pResgParam)
+{
+	HPR_INT32 iRetVal = HPR_ERROR;
+	HPR_INT8 szCodePW[ENGINE_CHAR_64 * 2] = {0}; //sha256加密后的密码
+	HPR_INT8 szBody[1024] = {0};           //组装的最终报文
+	HPR_INT8 szUrl[UTIL_MAX_URL_LEN] = {0};
+	HPR_INT8 szOutData[1024 * 4] = {0};
+	HPR_INT32 iLen = sizeof(szOutData);
+
+	do
+	{
+		if (NULL == pResgParam)
+		{
+			break;
+		}
+
+		HPR_INT8 szTmp[ENGINE_CHAR_64 * 4] = {0};
+		if (pResgParam->bIrrerverible == 0)
+		{
+			/*当设备要求不可逆密码存储时
+			SHA256 ((SHA256(password)+ challenge)) [iterations-1]*/
+			//HPR_Snprintf(szTmp, sizeof(szTmp), "%s%s", pResgParam->szPassword, pResgParam->szChallenge);
+			sha256_encode(pResgParam->szPassword, strlen(pResgParam->szPassword), szCodePW);
+			HPR_Snprintf(szTmp, sizeof(szTmp), "%s%s", szCodePW, pResgParam->szChallenge);
+			sha256_encode(szTmp, strlen(szTmp), szCodePW);
+		}else
+		{
+			/*当设备支持可逆密码存储时
+			SHA256 ((SHA256(user, salt, password)+ challenge)) [iterations-1]*/
+			HPR_Snprintf(szTmp, sizeof(szTmp), "%s%s%s", pResgParam->szUserName, pResgParam->szSalt, pResgParam->szPassword);
+			sha256_encode(szTmp, strlen(szTmp), szCodePW);
+			HPR_Snprintf(szTmp, sizeof(szTmp), "%s%s", szCodePW, pResgParam->szChallenge);
+			sha256_encode(szTmp, strlen(szTmp), szCodePW);
+		}
+
+		for (HPR_INT8 i = 1; i < pResgParam->iIterations; i++)
+		{
+			memset(szTmp, 0, sizeof(szTmp));
+			HPR_Snprintf(szTmp, sizeof(szTmp), "%s", szCodePW);
+
+
+			memset(szCodePW, 0, sizeof(szCodePW));
+			sha256_encode(szTmp, strlen(szTmp), szCodePW);
+			ENGINE_INFO("sha[%d]:tmp[%s] pw[%s]", i, szTmp, szCodePW);
+		}
+		HPR_Snprintf(szBody, sizeof(szBody), ENGINE_RES_PARAM, pResgParam->szUserName, szCodePW, pResgParam->szSession);
+
+		HPR_Snprintf(szUrl,sizeof(szUrl), ENGINE_REGISTER_URL, pResgParam->szIp, pResgParam->iPort);
+
+		ENGINE_DEBUG("url:[%s]", szUrl);
+		ENGINE_DEBUG("body:[%s]", szBody);
+
+		iRetVal = URLOPT_Post(szUrl, (HPR_UINT8 *)szBody, strlen(szBody), (HPR_UINT8 *)szOutData, (HPR_UINT32 *)&iLen, 5);
+		if (HPR_OK != iRetVal)
+		{
+			ENGINE_ERR();
+			break;
+		}
+
+		ENGINE_DEBUG("%s", szOutData);
+		iRetVal = engine_parse_register_val(szOutData);
+	}while(0);
+
+	return iRetVal;
+}
